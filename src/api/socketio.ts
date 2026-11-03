@@ -63,9 +63,12 @@ export interface UpdateSchema {
     hash?: string, //(not needed if lastV is provided)
     dupIfSource?: string[], //publicIds an earlier submission of this update may have come from
     meta?: {
-        source: string, //socketio client id
-        ts: number, //unix timestamp
-        user_id: string,
+        // set by the server on updates it broadcasts
+        source?: string, //socketio client id
+        ts?: number, //unix timestamp
+        user_id?: string,
+        // sent by us: record the update as tracked changes (see generateTrackChangesIdSeed)
+        tc?: string,
     }
 }
 
@@ -86,6 +89,26 @@ export interface EventsHandler {
     onSpellCheckLanguageUpdated?: (language:string) => void,
     onCompilerUpdated?: (compiler:string) => void,
     onRootDocUpdated?: (rootDocId:string) => void,
+    onTrackChangesToggled?: (state:TrackChangesState) => void,
+}
+
+/**
+ * A project's track changes state, as sent in joinProject and 'toggle-track-changes':
+ * `true` (legacy) = on for everyone, otherwise on for the user ids mapped to `true`.
+ */
+export type TrackChangesState = boolean | {[userId:string]: boolean};
+
+/**
+ * The seed Overleaf builds tracked-change ids from: the first 18 hex characters of a
+ * Mongo ObjectId, the last 6 being an increment the server adds per change. Sending it
+ * as `meta.tc` on an update makes the server record the update as tracked changes.
+ * Port of RangesTracker.generateIdSeed (overleaf/libraries/ranges-tracker).
+ */
+export function generateTrackChangesIdSeed(): string {
+    const pid = Math.floor(Math.random() * 32767).toString(16);
+    const machine = Math.floor(Math.random() * 16777216).toString(16);
+    const timestamp = Math.floor(Date.now() / 1000).toString(16);
+    return timestamp.padStart(8, '0') + machine.padStart(6, '0') + pid.padStart(4, '0');
 }
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
@@ -101,6 +124,9 @@ export class SocketIOAPI {
     private emit: any;
     /** Track the scheme used when the socket was last initialized */
     private _socketInitScheme?: ConnectionScheme;
+    /** The user's privilege level in the project, as reported on joining it
+     *  ('owner' | 'readAndWrite' | 'review' | 'readOnly') */
+    private _permissionsLevel?: string;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -184,6 +210,10 @@ export class SocketIOAPI {
     }
 
     /** Returns true if the socket needs re-initialization (scheme changed, or socket was never init'd) */
+    get permissionsLevel(): string | undefined {
+        return this._permissionsLevel;
+    }
+
     get needsReinit(): boolean {
         return this._socketInitScheme !== this.scheme || !this.socket;
     }
@@ -261,6 +291,7 @@ export class SocketIOAPI {
                 this.socket.on('joinProjectResponse', (res:any) => {
                     const publicId = res.publicId as string;
                     const project = res.project as ProjectEntity;
+                    this._permissionsLevel = res.permissionsLevel;
                     EventBus.fire('socketioConnectedEvent', {publicId});
                     resolve(project);
                 });
@@ -370,6 +401,11 @@ export class SocketIOAPI {
                         handler(compiler);
                     });
                     break;
+                case handlers.onTrackChangesToggled:
+                    this.socket.on('toggle-track-changes', (state:TrackChangesState) => {
+                        handler(state);
+                    });
+                    break;
                 case handlers.onRootDocUpdated:
                     this.socket.on('rootDocUpdated', (rootDocId:string) => {
                         handler(rootDocId);
@@ -412,6 +448,7 @@ export class SocketIOAPI {
                 const joinPromise = this.emit('joinProject', {project_id})
                 .then((returns:[ProjectEntity, string, number]) => {
                     const [project, permissionsLevel, protocolVersion] = returns;
+                    this._permissionsLevel = permissionsLevel;
                     this.record = Promise.resolve(project);
                     return project;
                 });

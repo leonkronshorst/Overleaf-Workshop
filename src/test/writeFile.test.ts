@@ -23,6 +23,7 @@ const vscodeMock = withStubs({
     EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
     FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
     workspace: withStubs({ textDocuments: [] }),
+    l10n: { t: (message: string) => message },
 });
 const moduleAny = Module as any;
 const originalLoad = moduleAny._load;
@@ -117,11 +118,14 @@ function setup(initialContent: string) {
     vfs._resolveById = () => ({ path: '/main.tex', fileEntity: doc });
     vfs.pathToUri = () => uri;
     vfs.connections = [];
+    vfs.userId = 'me';
+    vfs.projectName = 'test';
+    vfs.root = { rootFolder: [{}] };
     vfs.remoteWatch();
     handlers.onConnectionAccepted(server.publicId);
 
     return {
-        server, doc, editor,
+        server, doc, editor, vfs, handlers,
         open: async () => new TextDecoder().decode(await vfs.openFile(uri)),
         save: (text: string) => vfs.writeFile(uri, new TextEncoder().encode(text), false, true),
         /** another client (e.g. the web editor) inserts `text` at `p` */
@@ -235,5 +239,91 @@ describe('SocketIOAPI.applyOtUpdate', () => {
 
         await api.applyOtUpdate('doc1', { doc: 'doc1', v: 1, op: [{ p: 0, i: 'x' }] });
         assert.strictEqual(emitted.length, 1);
+    });
+});
+
+describe('VirtualFileSystem tracked changes', () => {
+    const ackTimeout = VirtualFileSystem.ownUpdateAckTimeoutMs;
+    before(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = 20; });
+    after(() => { VirtualFileSystem.ownUpdateAckTimeoutMs = ackTimeout; });
+
+    const isSeed = (tc: any) => typeof tc === 'string' && /^[0-9a-f]{18}$/.test(tc);
+
+    it('sends an untracked update while track changes is off', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.vfs.root.trackChangesState = { someoneElse: true };
+        await t.save('hello a');
+        await settle();
+        assert.strictEqual(t.server.emitted[0].meta, undefined);
+    });
+
+    it('sends a tracked update once this user turns track changes on (Reviewing mode)', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.handlers.onTrackChangesToggled({ me: true });
+        await t.save('hello a');
+        await settle();
+        assert.ok(isSeed(t.server.emitted[0].meta?.tc), 'meta.tc must be an 18-hex-digit id seed');
+        assert.deepStrictEqual(Object.keys(t.server.emitted[0].meta), ['tc'],
+            'the server only accepts tc in meta');
+
+        t.handlers.onTrackChangesToggled({ me: false });
+        await t.save('hello a b');
+        await settle();
+        assert.strictEqual(t.server.emitted[1].meta, undefined);
+        assert.strictEqual(t.server.content, 'hello a b');
+    });
+
+    it('tracks when track changes is on for everyone (legacy state)', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.vfs.root.trackChangesState = true;
+        await t.save('hello a');
+        await settle();
+        assert.ok(isSeed(t.server.emitted[0].meta?.tc));
+    });
+
+    it('always tracks for a user with the Reviewer role', async () => {
+        const t = setup('hello');
+        await t.open();
+        (t.vfs.socket as any).permissionsLevel = 'review';
+        t.vfs.root.trackChangesState = false;
+        await t.save('hello a');
+        await settle();
+        assert.ok(isSeed(t.server.emitted[0].meta?.tc));
+    });
+
+    it('re-sends a tracked update with the same id seed', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.vfs.root.trackChangesState = { me: true };
+        t.server.loseNextCallback = () => t.collaborator(0, '# ');
+        await t.save('hello a');
+        await settle();
+        assert.strictEqual(t.server.content, '# hello a');
+        assert.ok(isSeed(t.server.emitted[0].meta?.tc));
+        assert.strictEqual(t.server.emitted[1].meta?.tc, t.server.emitted[0].meta.tc);
+    });
+
+    it('gives every update a fresh id seed', async () => {
+        const t = setup('hello');
+        await t.open();
+        t.vfs.root.trackChangesState = { me: true };
+        await t.save('hello a');
+        await settle();
+        await t.save('hello a b');
+        await settle();
+        assert.notStrictEqual(t.server.emitted[0].meta.tc, t.server.emitted[1].meta.tc);
+    });
+});
+
+describe('generateTrackChangesIdSeed', () => {
+    const { generateTrackChangesIdSeed } = require('../api/socketio');
+    it('matches what Overleaf accepts: 18 hex digits, starting with the current time', () => {
+        const seed = generateTrackChangesIdSeed();
+        assert.match(seed, /^[0-9a-f]{18}$/);
+        const ts = parseInt(seed.slice(0, 8), 16);
+        assert.ok(Math.abs(ts - Date.now() / 1000) < 5);
     });
 });

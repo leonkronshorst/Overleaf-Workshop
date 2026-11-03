@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
-import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { SocketIOAPI, UpdateSchema, TrackChangesState, generateTrackChangesIdSeed } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
@@ -98,6 +98,7 @@ export interface ProjectEntity {
     owner: MemberEntity,
     features: {[key:string]:any},
     settings: ProjectSettingsSchema,
+    trackChangesState?: TrackChangesState,
 }
 
 export class File implements vscode.FileStat {
@@ -177,6 +178,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
+            this.trackChangesStatusItem?.dispose();
+            this.trackChangesStatusItem = undefined;
             // disconnect socketio
             // this.socket.disconnect();
         });
@@ -306,6 +309,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
                 project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
                 this.root = project;
+                this.updateTrackChangesIndicator();
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
                 if (activeCondition) {
@@ -476,6 +480,33 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    /**
+     * Whether this user's edits must go in as tracked changes, following Overleaf's own
+     * rule (ProjectHelper.isTrackChangesEnabledForUser): on for everyone (legacy `true`),
+     * or on for this user, i.e. their editor is in "Reviewing" mode. A user with the
+     * Reviewer role can only make tracked changes, so theirs always are.
+     */
+    get isTrackingChanges(): boolean {
+        if (this.socket.permissionsLevel === 'review') { return true; }
+        const state = this.root?.trackChangesState;
+        return state === true || (typeof state === 'object' && state !== null && state[this.userId] === true);
+    }
+
+    private trackChangesStatusItem?: vscode.StatusBarItem;
+
+    private updateTrackChangesIndicator() {
+        if (!this.isTrackingChanges) {
+            this.trackChangesStatusItem?.hide();
+            return;
+        }
+        if (!this.trackChangesStatusItem) {
+            this.trackChangesStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+            this.trackChangesStatusItem.text = '$(git-pull-request-draft) ' + vscode.l10n.t('Track changes');
+            this.trackChangesStatusItem.tooltip = vscode.l10n.t('Your saves to {projectName} are recorded as suggestions. Accept or reject them in the browser.', {projectName: this.projectName});
+        }
+        this.trackChangesStatusItem.show();
+    }
+
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
@@ -600,6 +631,17 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.root.compiler = compiler;
                     EventBus.fire('compilerUpdateEvent', {compiler});
                 }
+            },
+            onTrackChangesToggled: (state:TrackChangesState) => {
+                if (!this.root) { return; }
+                const wasTracking = this.isTrackingChanges;
+                this.root.trackChangesState = state;
+                if (this.isTrackingChanges !== wasTracking) {
+                    vscode.window.showInformationMessage(this.isTrackingChanges
+                        ? vscode.l10n.t('Track changes is on: your saves to {projectName} are now recorded as suggestions.', {projectName: this.projectName})
+                        : vscode.l10n.t('Track changes is off: your saves to {projectName} are now applied directly.', {projectName: this.projectName}));
+                }
+                this.updateTrackChangesIndicator();
             },
             onRootDocUpdated: (rootDocId:string) => {
                 //NOTE: do not sync rootDocId
@@ -938,6 +980,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 doc: doc._id,
                 lastV: doc.lastVersion,
                 v: doc.version!,
+                // Tracked changes: the server builds the change ids from this seed. It is part
+                // of the update, so a re-send (dupIfSource) carries the very same seed.
+                ...(this.isTrackingChanges ? { meta: { tc: generateTrackChangesIdSeed() } } : {}),
                 // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
                 hash: (()=>{
                     if (!doc.mtime || Date.now()-doc.mtime>5000) {

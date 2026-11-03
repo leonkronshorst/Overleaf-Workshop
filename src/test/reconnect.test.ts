@@ -22,6 +22,7 @@ const vscodeMock = withStubs({
     EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
     FileChangeType: { Changed: 1, Created: 2, Deleted: 3 },
     workspace: withStubs({ textDocuments: [] }),
+    l10n: { t: (message: string) => message },
 });
 const moduleAny = Module as any;
 const originalLoad = moduleAny._load;
