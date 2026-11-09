@@ -4,6 +4,7 @@ import * as FormData from 'form-data';
 import { v4 as uuidv4 } from 'uuid';
 import { fetch } from 'undici';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+import type { CommentThread, DocRanges } from './socketio';
 
 /** Extract set-cookie headers from an undici/Response object. */
 function getSetCookie(res: any): string[] {
@@ -197,6 +198,8 @@ export interface ResponseSchema {
     treeDiff?: ProjectFileTreeDiffResponseSchema;
     messages?: ProjectMessageResponseSchema[];
     settings?: ProjectSettingsSchema;
+    threads?: {[threadId:string]: CommentThread};
+    ranges?: {id:string, ranges:DocRanges}[];
 }
 
 export class BaseAPI {
@@ -608,7 +611,9 @@ export class BaseAPI {
 
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/upload?folder_id=${parentFolderId}`, formData, (res) => {
-            const {success, entity_id, entity_type} = JSON.parse(res!) as any;
+            const {success, entity_id, entity_type, error} = JSON.parse(res!) as any;
+            // a refused upload also comes as 200, with success false
+            if (success===false || !entity_type) { return {entity: undefined, message: String(error ?? res)}; }
             const entity = {_type:entity_type, _id:entity_id, name:filename} as FileEntity;
             return {entity};
         }, {'X-Csrf-Token': identity.csrfToken});
@@ -924,5 +929,67 @@ export class BaseAPI {
     async sendMessage(identity:Identity, projectId:string, client_id:string, content:string) {
         this.setIdentity(identity);
         return this.request('POST', `project/${projectId}/messages`, {client_id, content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    // Review: tracked changes and comments. Routes as the web editor calls them
+    // (services/web/frontend/js/features/review-panel/context/*).
+
+    /** Turn track changes on or off per user: `onFor` maps user ids to their state. */
+    async setTrackChanges(identity:Identity, projectId:string, onFor:{[userId:string]:boolean}) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/track_changes`, {on_for: onFor}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async acceptChanges(identity:Identity, projectId:string, docId:string, changeIds:string[]) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/doc/${docId}/changes/accept`, {change_ids: changeIds}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async getThreads(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/threads`, undefined, (res) => {
+            const threads = JSON.parse(res!) as {[threadId:string]: CommentThread};
+            return {threads};
+        }, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    /** Post a message to a thread; the first message of a new thread creates it. */
+    async sendThreadMessage(identity:Identity, projectId:string, threadId:string, content:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/thread/${threadId}/messages`, {content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async editThreadMessage(identity:Identity, projectId:string, threadId:string, messageId:string, content:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/thread/${threadId}/messages/${messageId}/edit`, {content}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async deleteOwnThreadMessage(identity:Identity, projectId:string, threadId:string, messageId:string) {
+        this.setIdentity(identity);
+        return this.request('DELETE', `project/${projectId}/thread/${threadId}/own-messages/${messageId}`);
+    }
+
+    async resolveThread(identity:Identity, projectId:string, docId:string, threadId:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/doc/${docId}/thread/${threadId}/resolve`, {}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async reopenThread(identity:Identity, projectId:string, docId:string, threadId:string) {
+        this.setIdentity(identity);
+        return this.request('POST', `project/${projectId}/doc/${docId}/thread/${threadId}/reopen`, {}, undefined, {'X-Csrf-Token': identity.csrfToken});
+    }
+
+    async deleteThread(identity:Identity, projectId:string, docId:string, threadId:string) {
+        this.setIdentity(identity);
+        return this.request('DELETE', `project/${projectId}/doc/${docId}/thread/${threadId}`);
+    }
+
+    /** The tracked changes and comments of every doc in the project. */
+    async getProjectRanges(identity:Identity, projectId:string) {
+        this.setIdentity(identity);
+        return this.request('GET', `project/${projectId}/ranges`, undefined, (res) => {
+            const ranges = JSON.parse(res!) as {id:string, ranges:DocRanges}[];
+            return {ranges};
+        }, {'X-Csrf-Token': identity.csrfToken});
     }
 }

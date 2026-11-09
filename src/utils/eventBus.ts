@@ -11,6 +11,8 @@ export type Events = {
     'rootDocUpdateEvent': {rootDocId:string},
     'scmStatusChangeEvent': {status:StatusInfo},
     'socketioConnectedEvent': {publicId:string},
+    /** tracked changes, comments or the track changes state of a project changed */
+    'reviewChangedEvent': {origin: vscode.Uri, docId?: string},
 };
 
 export class EventBus {

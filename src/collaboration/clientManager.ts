@@ -55,20 +55,25 @@ function formatTime(timestamp:number) {
 /** Shows a project that is not joined: yellow while it reconnects by itself, red once it
  *  gave up (click for Retry or Reload). Used by the collaboration item, and before the
  *  first join, when that item does not exist yet, by the file system's own item. */
-export function showConnectionProblem(item: vscode.StatusBarItem, status: {state: string, attempt: number, detail?: string}) {
+export function showConnectionProblem(item: vscode.StatusBarItem, status: {state: string, attempt: number, detail?: string},
+                                      reviewing?: boolean) {
     item.backgroundColor = undefined;
+    // the mode, also while offline: the saves kept meanwhile go up in it (click: switch)
+    const mode = reviewing===undefined ? '' : reviewing ? `$(git-pull-request-draft) ${vscode.l10n.t('Reviewing')} ` : '$(edit) ';
+    const modeTip = reviewing===undefined ? '' : '\n' + (reviewing
+        ? vscode.l10n.t('Reviewing: your saves become suggestions, also those kept while offline. Click to switch.')
+        : vscode.l10n.t('Editing: your saves are applied directly, also those kept while offline. Click to switch.'));
+    item.command = `${ROOT_NAME}.remoteFileSystem.connectionMenu`;
     if (status.state === 'offline') {
         item.color = 'red';
-        item.text = '$(sync-ignored)';
-        item.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Not connected. Automatic reconnecting gave up; click for Retry or Reload.')}`;
-        item.command = `${ROOT_NAME}.remoteFileSystem.reconnect`;
+        item.text = mode + '$(sync-ignored)';
+        item.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Not connected. Automatic reconnecting gave up; click for Retry or Reload.')}` + modeTip;
     } else {
         item.color = new vscode.ThemeColor('statusBarItem.warningBackground');
-        item.text = '$(sync~spin) ' + vscode.l10n.t('Reconnecting...') + (status.attempt > 0 ? ` ${status.attempt}` : '');
+        item.text = mode + '$(sync~spin) ' + vscode.l10n.t('Reconnecting...') + (status.attempt > 0 ? ` ${status.attempt}` : '');
         item.tooltip = `${ELEGANT_NAME}: ` +
             vscode.l10n.t('Not connected, reconnecting automatically (attempt {attempt}).', {attempt: status.attempt}) +
-            (status.detail ? ' ' + status.detail : '');
-        item.command = undefined;
+            (status.detail ? ' ' + status.detail : '') + modeTip;
     }
 }
 
@@ -272,7 +277,7 @@ export class ClientManager {
         const connection = this.vfs.connectionStatus;
         if (connection.state !== 'connected' || !this.connectedFlag) {
             if (this.disconnectedAt === 0) { this.disconnectedAt = Date.now(); }
-            showConnectionProblem(this.status, connection);
+            showConnectionProblem(this.status, connection, this.reviewMode?.reviewing);
             // Keep online user decorations during brief disconnections only
             if (Date.now() - this.disconnectedAt >= ClientManager.DISCONNECT_GRACE_PERIOD_MS) {
                 Object.keys(this.onlineUsers).forEach(clientId => {
@@ -295,6 +300,11 @@ export class ClientManager {
             if (unSynced) {
                 prefixText = prefixText.concat(`$(arrow-up) ${unSynced} `);
             }
+            // Editing/Reviewing, as the web editor's switch (click: the menu offers to switch)
+            const mode = this.reviewMode;
+            if (mode) {
+                prefixText = prefixText.concat(mode.reviewing ? `$(git-pull-request-draft) ${vscode.l10n.t('Reviewing')} ` : '$(edit) ');
+            }
 
             const isInvisible = this.socket.isUsingAlternativeConnectionScheme;
             const onlineIcon = isInvisible ? '$(person)' : '$(organization)';
@@ -302,7 +312,7 @@ export class ClientManager {
                 case 0:
                     this.status.color = undefined;
                     this.status.text = prefixText + `${onlineIcon} 0`;
-                    this.status.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Online')}`;
+                    this.status.tooltip = `${ELEGANT_NAME}: ${vscode.l10n.t('Online')}` + (mode ? `\n${mode.tooltip}` : '');
                     break;
                 default:
                     this.status.color = this.activeExists ? this.onlineUsers[this.activeExists].selection?.color : undefined;
@@ -324,15 +334,29 @@ export class ClientManager {
                         const timeInfo = since_last_update==='' ? vscode.l10n.t('Just now') : vscode.l10n.t('{since_last_update} ago', {since_last_update});
                         tooltip.appendMarkdown(`${userInfo} ${cursorInfo} ${timeInfo}\n\n`);
                     });
+                    if (mode) { tooltip.appendMarkdown(`${mode.tooltip}\n\n`); }
                     tooltip.isTrusted = true;
                     tooltip.supportHtml = true;
                     this.status.tooltip = tooltip;
                     break;
             }
         }
-        
+
         this.status.show();
         setTimeout(this.updateStatus.bind(this), 500);
+    }
+
+    /** Editing or Reviewing (track changes) for this user; undefined for read-only access. */
+    private get reviewMode(): {reviewing: boolean, canSwitch: boolean, tooltip: string} | undefined {
+        const level = this.vfs.permissionsLevel;
+        if (level === 'readOnly') { return undefined; }
+        const reviewing = this.vfs.knownTracking ?? this.vfs.isTrackingChanges;
+        const canSwitch = level !== 'review';
+        const tooltip = reviewing
+            ? (canSwitch ? vscode.l10n.t('Reviewing: your saves are recorded as suggestions.')
+                         : vscode.l10n.t('Reviewer: your saves are recorded as suggestions.'))
+            : vscode.l10n.t('Editing: your saves are applied directly.');
+        return {reviewing, canSwitch, tooltip};
     }
 
     setStatusActive(clientId:string, timeout:number=10) {
@@ -346,7 +370,12 @@ export class ClientManager {
     collaborationSettings() {
         const isInvisible = this.socket.isUsingAlternativeConnectionScheme;
         const useAction = isInvisible ? 'Exit' : 'Enter';
+        const mode = this.reviewMode;
         const quickPickItems = [
+            ...(mode?.canSwitch ? [mode.reviewing
+                ? {id:'trackChanges', label:'$(edit) ' + vscode.l10n.t('Switch to Editing'), detail:vscode.l10n.t('Your saves are applied directly.')}
+                : {id:'trackChanges', label:'$(git-pull-request-draft) ' + vscode.l10n.t('Switch to Reviewing'), detail:vscode.l10n.t('Your saves are recorded as suggestions (track changes).')},
+            ] : []),
             {id:'jump', label:vscode.l10n.t('Jump to Collaborator ...'), detail:''},
             // {id:'tether', label:'Tether to Collaborator ...',detail:''},
             {label:'',kind:vscode.QuickPickItemKind.Separator},
@@ -363,6 +392,9 @@ export class ClientManager {
         }).then(async item => {
             if (item === undefined) { return; }
             switch (item.id) {
+                case 'trackChanges':
+                    vscode.commands.executeCommand(`${ROOT_NAME}.review.toggleTrackChanges`);
+                    break;
                 case 'jump':
                     this.jumpToUser();
                     break;

@@ -241,7 +241,7 @@ describe('VirtualFileSystem reconnect', () => {
             // the project was never joined here, so there is no collaboration item: our own one is red
             assert.match(item.text, /sync-ignored/);
             assert.strictEqual(item.color, 'red');
-            assert.match(item.command, /remoteFileSystem\.reconnect$/);
+            assert.match(item.command, /remoteFileSystem\.connectionMenu$/, 'click: switch the mode, Retry, Reload');
             await vfs.init().then(
                 () => assert.fail('init() must fail while waiting for Retry'),
                 (err: any) => assert.match(String(err), /Not connected/));
@@ -261,8 +261,12 @@ describe('VirtualFileSystem reconnect', () => {
         vscodeMock.window = withStubs({ createStatusBarItem: () => { created += 1; return item; } });
         const { vfs } = setup({ dead: false });
         try {
+            vfs.attemptCount = 2;
             vfs.updateConnectionStatus('reconnecting');
-            assert.strictEqual(created, 1, 'before the first join: own item');
+            assert.strictEqual(created, 0, 'an ordinary first connection (two attempts) shows nothing');
+            vfs.attemptCount = 3;
+            vfs.updateConnectionStatus('reconnecting');
+            assert.strictEqual(created, 1, 'before the first join, when it takes longer: own item');
             vfs.updateConnectionStatus('connected');
             assert.strictEqual(item.disposed, true, 'gone once joined');
             vfs.clientManagerItem = { triggers: [] };  // joined once: the collaboration item exists

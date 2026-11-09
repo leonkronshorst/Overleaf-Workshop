@@ -9,6 +9,61 @@ function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
 }
 
+/** A doc's tracked changes and comments, as joinDoc returns them. */
+export interface DocRanges {
+    changes?: {id:string, op:{p:number, i?:string, d?:string}, metadata?:{user_id?:string|null, ts?:string}}[],
+    comments?: {id:string, op:{p:number, c:string, t:string}, metadata?:{user_id?:string|null, ts?:string}}[],
+}
+
+/**
+ * With `encodeRanges`, the texts in a doc's ranges come packed like its lines (UTF-8 bytes
+ * as latin1 characters, see WebsocketController.joinDoc). Positions are not encoded.
+ */
+function decodeRanges(ranges?: DocRanges): DocRanges {
+    return {
+        changes: (ranges?.changes ?? []).map((change) => ({
+            ...change,
+            op: {
+                ...change.op,
+                ...(change.op.i!==undefined ? {i: decodePackedUtf8(change.op.i)} : {}),
+                ...(change.op.d!==undefined ? {d: decodePackedUtf8(change.op.d)} : {}),
+            },
+        })),
+        comments: (ranges?.comments ?? []).map((comment) => ({
+            ...comment,
+            op: {...comment.op, c: decodePackedUtf8(comment.op.c)},
+        })),
+    };
+}
+
+/** Review events the server broadcasts to a project's clients. */
+export type ThreadEvent =
+    | {type: 'new-comment', threadId: string, message: ThreadMessage}
+    | {type: 'edit-message', threadId: string, messageId: string, content: string}
+    | {type: 'delete-message', threadId: string, messageId: string}
+    | {type: 'resolve-thread', threadId: string, user?: ThreadUser}
+    | {type: 'reopen-thread', threadId: string}
+    | {type: 'delete-thread', threadId: string};
+
+export interface ThreadUser { id: string, first_name?: string, last_name?: string, email?: string }
+
+export interface ThreadMessage {
+    id: string,
+    content: string,
+    timestamp: number|string,
+    user_id: string,
+    user?: ThreadUser,
+    edited_at?: number|string,
+}
+
+export interface CommentThread {
+    messages: ThreadMessage[],
+    resolved?: boolean,
+    resolved_at?: string,
+    resolved_by_user_id?: string,
+    resolved_by_user?: ThreadUser,
+}
+
 /** How long to wait for a server acknowledgement before giving up on an emit. */
 const EMIT_TIMEOUT_MS = 15000;
 
@@ -57,7 +112,9 @@ export interface UpdateSchema {
         p: number, //position
         i?: string, //insert
         d?: string, //delete
-        u?: boolean, //isUndo
+        c?: string, //comment: the commented text (content unchanged)
+        t?: string, //comment: thread id
+        u?: boolean, //isUndo; also how a tracked change is rejected
     }[],
     v: number, //doc version number
     lastV?: number, //last version number
@@ -93,6 +150,9 @@ export interface EventsHandler {
     onCompilerUpdated?: (compiler:string) => void,
     onRootDocUpdated?: (rootDocId:string) => void,
     onTrackChangesToggled?: (state:TrackChangesState) => void,
+    /** tracked changes in a doc were accepted (by anyone, us included) */
+    onChangesAccepted?: (docId:string, changeIds:string[]) => void,
+    onThreadEvent?: (event:ThreadEvent) => void,
 }
 
 /**
@@ -459,6 +519,32 @@ export class SocketIOAPI {
                         handler(rootDocId);
                     });
                     break;
+                case handlers.onChangesAccepted:
+                    this.socket.on('accept-changes', (docId:string, changeIds:string[]) => {
+                        handler(docId, changeIds);
+                    });
+                    break;
+                case handlers.onThreadEvent:
+                    // payloads as in review-panel/context/threads-context.tsx
+                    this.socket.on('new-comment', (threadId:string, message:ThreadMessage) => {
+                        handler({type:'new-comment', threadId, message});
+                    });
+                    this.socket.on('edit-message', (threadId:string, messageId:string, content:string) => {
+                        handler({type:'edit-message', threadId, messageId, content});
+                    });
+                    this.socket.on('delete-message', (threadId:string, messageId:string) => {
+                        handler({type:'delete-message', threadId, messageId});
+                    });
+                    this.socket.on('resolve-thread', (threadId:string, user:ThreadUser) => {
+                        handler({type:'resolve-thread', threadId, user});
+                    });
+                    this.socket.on('reopen-thread', (threadId:string) => {
+                        handler({type:'reopen-thread', threadId});
+                    });
+                    this.socket.on('delete-thread', (threadId:string) => {
+                        handler({type:'delete-thread', threadId});
+                    });
+                    break;
                 default:
                     break;
             }
@@ -521,10 +607,10 @@ export class SocketIOAPI {
      */
     async joinDoc(docId:string) {
         return this.emit('joinDoc', docId, { encodeRanges: true })
-            .then((returns: [Array<string>, number, Array<any>, any]) => {
+            .then((returns: [Array<string>, number, Array<any>, DocRanges|undefined]) => {
                 const [docLinesAscii, version, updates, ranges] = returns;
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges};
+                return {docLines, version, updates, ranges: decodeRanges(ranges)};
             });
     }
 

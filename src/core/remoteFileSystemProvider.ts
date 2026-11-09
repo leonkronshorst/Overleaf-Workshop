@@ -2,7 +2,9 @@
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
-import { SocketIOAPI, UpdateSchema, TrackChangesState, generateTrackChangesIdSeed } from '../api/socketio';
+import { SocketIOAPI, UpdateSchema, TrackChangesState, generateTrackChangesIdSeed, DocRanges, CommentThread, ThreadEvent } from '../api/socketio';
+import { RangesTracker } from '../review/rangesTracker';
+import { EditRecorder } from './editRecorder';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager, showConnectionProblem } from '../collaboration/clientManager';
@@ -10,6 +12,16 @@ import { EventBus } from '../utils/eventBus';
 import { log } from '../utils/log';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
+import { RefusedError, StaleRemoteError, applyOps as applyTextOps, toLf } from '../scm/replicaJournal';
+
+/**
+ * The error of a request Overleaf answered with a refusal (4xx: the thread or message is
+ * gone, ...), which a replay skips; anything else (no answer) stays a plain error.
+ */
+function refused(message?: string): Error {
+    return /^4\d\d:/.test(message ?? '') ? new RefusedError(message) : new Error(message ?? 'unknown error');
+}
+import { isText } from '../scm/replicaBase';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -46,6 +58,12 @@ export interface DocumentEntity extends FileEntity {
     },
     /** A write whose emit failed, not known to have reached the server (see submitWrite). */
     unconfirmed?: PendingWrite,
+    /**
+     * Tracked changes and comments, positioned in `remoteCache`. Kept up to date by
+     * applying every op the server applies, in the same order; undefined until the doc
+     * is joined, or after it went out of step (re-read with the doc).
+     */
+    ranges?: RangesTracker,
 }
 
 interface PendingWrite {
@@ -117,6 +135,87 @@ export class File implements vscode.FileStat {
         this.size = 0;
         this.permissions = permissions;
     }
+}
+
+/**
+ * The undo ops that reject `changes` (tracked changes positioned in `content`), and the
+ * content they lead to.
+ *
+ * All reverts are computed on `content` first and combined per position, then sent in
+ * order, each moved by the ones before it -- as the web editor does with one CodeMirror
+ * transaction. Reverting them one by one goes wrong where an insertion and a deletion
+ * share a position (a replaced word): putting the deleted text back moves the inserted
+ * text away from where the next revert expects it.
+ */
+export function rejectOps(content: string, changes: {op: {p: number, i?: string, d?: string}}[]) {
+    const byPosition = new Map<number, {from: number, to: number, insert: string}>();
+    // the tracker keeps deletions at one position in the order of their text
+    for (const change of changes) {
+        const p = change.op.p;
+        const edit = byPosition.get(p) ?? {from: p, to: p, insert: ''};
+        if (change.op.i !== undefined) {
+            if (content.slice(p, p + change.op.i.length) !== change.op.i) {
+                throw new Error('the inserted text is not where it was tracked');
+            }
+            edit.to = Math.max(edit.to, p + change.op.i.length);
+        } else if (change.op.d !== undefined) {
+            edit.insert += change.op.d;
+        }
+        byPosition.set(p, edit);
+    }
+    const ops: {p: number, i?: string, d?: string, u: boolean}[] = [];
+    let result = '';
+    let done = 0;       // how much of `content` is in `result`
+    for (const edit of [...byPosition.values()].sort((a, b) => a.from - b.from)) {
+        if (edit.from < done) {
+            throw new Error('the changes overlap; please reject them one at a time');
+        }
+        result += content.slice(done, edit.from);
+        const p = result.length;
+        if (edit.to > edit.from) { ops.push({p, d: content.slice(edit.from, edit.to), u: true}); }
+        if (edit.insert) { ops.push({p, i: edit.insert, u: true}); }
+        result += edit.insert;
+        done = edit.to;
+    }
+    return {ops, content: result + content.slice(done)};
+}
+
+/**
+ * The ops a save of `uri` sends to turn the server's `from` into `to`: the edits made in
+ * the editor, as the web editor sends them, if they lead exactly there (see EditRecorder);
+ * otherwise a diff. The review preview of unsaved edits uses this too, so it shows
+ * exactly what the save will record.
+ */
+export function editOps(uri: vscode.Uri | string, from: string, to: string): {p: number, i?: string, d?: string}[] {
+    if (from === to) { return []; }
+    return EditRecorder.opsFor(uri, from, to) ?? textDiffOps(from, to);
+}
+
+/**
+ * The ops turning `from` into `to`: one insert or delete per differing part, each
+ * positioned after the ones before it have been applied. Cleaned up to whole words and
+ * phrases: a raw character diff matches stray letters and cuts typed text into fragments.
+ */
+export function textDiffOps(from: string, to: string): {p: number, i?: string, d?: string}[] {
+    const dmp = new DiffMatchPatch();
+    const diff = dmp.diff_main(from, to);
+    dmp.diff_cleanupSemantic(diff);
+    let currentPos = 0;
+    return diff
+        .map((part) => {
+            // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
+            const incCount = part[0] === -1 ? 0 : part[1].length;
+            currentPos += incCount;
+            // add op when content not equal
+            if (part[0] !== 0) {
+                return {
+                    p: currentPos - incCount,
+                    i: part[0] ===  1 ?  part[1] : undefined,
+                    d: part[0] === -1 ?  part[1] : undefined,
+                };
+            }
+        })
+        .filter(x => x) as {p: number, i?: string, d?: string}[];
 }
 
 export function parseUri(uri: vscode.Uri) {
@@ -200,8 +299,6 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
-            this.trackChangesStatusItem?.dispose();
-            this.trackChangesStatusItem = undefined;
             if (this.backgroundRetryTimer) { clearTimeout(this.backgroundRetryTimer); }
             this.backgroundRetryTimer = undefined;
             this.connectionStatusItem?.dispose();
@@ -284,12 +381,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.connectionState = state;
         this.connectionStatusDetail = detail;
         // The collaboration item shows the state once the project was joined. Before
-        // that (e.g. the window was opened offline) it does not exist: use our own item.
-        if (state !== 'connected' && !this.clientManagerItem) {
+        // that (e.g. the window was opened offline) it does not exist: use our own item,
+        // but not for an ordinary first connection, which takes two attempts on
+        // overleaf.com (the first scheme is always rejected) and about a second.
+        const worthShowing = state === 'offline' || this.attemptCount > 2;
+        if (state !== 'connected' && !this.clientManagerItem && worthShowing) {
             if (!this.connectionStatusItem) {
                 this.connectionStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
             }
-            showConnectionProblem(this.connectionStatusItem, this.connectionStatus);
+            const level = this.socket?.permissionsLevel;
+            showConnectionProblem(this.connectionStatusItem, this.connectionStatus, level==='readOnly' ? undefined : this.knownTracking);
             this.connectionStatusItem.show();
         } else {
             this.connectionStatusItem?.dispose();
@@ -421,9 +522,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.gaveUp = false;
                 this.attemptCount = 0;
                 this.root = project;
-                log('info', 'reconnect: project joined');
+                log('info', `reconnect: project joined (${this.isTrackingChanges ? 'Reviewing' : 'Editing'}, track changes ${JSON.stringify(project.trackChangesState ?? null)})`);
                 this.updateConnectionStatus('connected');
-                this.updateTrackChangesIndicator();
+                // a switch made while offline: settled before any new save goes up
+                await this.settleOfflineSwitch().catch((err) => log('warn', `review: could not apply the switch made while offline: ${err?.message ?? err}`));
                 const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
                 // Register: [collaboration] ClientManager on Statusbar
                 if (activeCondition) {
@@ -645,19 +747,459 @@ export class VirtualFileSystem extends vscode.Disposable {
         return state === true || (typeof state === 'object' && state !== null && state[this.userId] === true);
     }
 
-    private trackChangesStatusItem?: vscode.StatusBarItem;
+    // ---- Review: tracked changes and comments -------------------------------------------
 
-    private updateTrackChangesIndicator() {
-        if (!this.isTrackingChanges) {
-            this.trackChangesStatusItem?.hide();
+    /** comment threads by id, once loaded (see getThreads); kept up to date by socket events */
+    private threads?: {[threadId:string]: CommentThread};
+    private threadsLoading?: Promise<{[threadId:string]: CommentThread}>;
+
+    private fireReviewChanged(docId?: string) {
+        EventBus.fire('reviewChangedEvent', {origin: this.origin, docId});
+    }
+
+    /** The user's access: 'owner' | 'readAndWrite' | 'review' | 'readOnly' */
+    get permissionsLevel(): string | undefined {
+        return this.socket.permissionsLevel;
+    }
+
+    /** Switch this user between Editing and Reviewing, as the web editor's toggle does. */
+    async setTrackChangesForMe(on: boolean) {
+        if (!this.isJoined) {
+            await this.switchWhileOffline(on);
             return;
         }
-        if (!this.trackChangesStatusItem) {
-            this.trackChangesStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
-            this.trackChangesStatusItem.text = '$(git-pull-request-draft) ' + vscode.l10n.t('Track changes');
-            this.trackChangesStatusItem.tooltip = vscode.l10n.t('Your saves to {projectName} are recorded as suggestions. Accept or reject them in the browser.', {projectName: this.projectName});
+        const state = this.root?.trackChangesState;
+        // the legacy "on for everyone" (`true`) becomes per user, as in the web editor
+        const onFor: {[userId:string]:boolean} = typeof state === 'object' && state !== null ? {...state} : {};
+        onFor[this.userId] = on;
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.setTrackChanges(identity, this.projectId, onFor);
+        if (res.type !== 'success') {
+            throw new Error(res.message ?? 'unknown error');
         }
-        this.trackChangesStatusItem.show();
+        // the server also broadcasts 'toggle-track-changes'; do not wait for it
+        if (this.root) { this.root.trackChangesState = onFor; }
+        this.rememberTracking();
+        log('info', `review: switched to ${this.isTrackingChanges ? 'Reviewing' : 'Editing'} (sent ${JSON.stringify(onFor)})`);
+        this.fireReviewChanged();
+    }
+
+    /** A user's display name, from the project members or the comment threads. */
+    userName(userId?: string | null): string {
+        if (!userId) { return vscode.l10n.t('Unknown user'); }
+        if (userId === this.userId) { return vscode.l10n.t('You'); }
+        const members = [this.root?.owner, ...(this.root?.members ?? [])];
+        const member = members.find((m) => m?._id === userId);
+        if (member) { return [member.first_name, member.last_name].filter(Boolean).join(' ') || member.email; }
+        for (const thread of Object.values(this.threads ?? {})) {
+            const user = thread.messages.find((m) => m.user_id === userId)?.user;
+            if (user) { return [user.first_name, user.last_name].filter(Boolean).join(' ') || user.email || userId; }
+        }
+        return vscode.l10n.t('Unknown user');
+    }
+
+    get currentUserId(): string {
+        return this.userId;
+    }
+
+    /** All docs of the project with their paths. */
+    allDocs(): {doc: DocumentEntity, path: string}[] {
+        const docs: {doc: DocumentEntity, path: string}[] = [];
+        const walk = (folder: FolderEntity, path: string) => {
+            folder.docs?.forEach((doc) => docs.push({doc, path: path + doc.name}));
+            folder.folders?.forEach((sub) => walk(sub, path + sub.name + '/'));
+        };
+        const rootFolder = this.root?.rootFolder?.[0];
+        if (rootFolder) { walk(rootFolder, '/'); }
+        return docs;
+    }
+
+    /** The doc's server content and ranges if they are at hand, without any request. */
+    peekReviewDoc(docId: string): {doc: DocumentEntity, content: string, ranges: RangesTracker} | undefined {
+        const doc = this._resolveById(docId)?.fileEntity as DocumentEntity | undefined;
+        if (!doc || doc.remoteCache === undefined || !doc.ranges || doc.sync) { return undefined; }
+        return {doc, content: doc.remoteCache, ranges: doc.ranges};
+    }
+
+    /**
+     * The doc behind `uri` with its server content and ranges, joining it if need be.
+     * `base` is the content the editor was last loaded from or saved: unsaved edits are
+     * relative to it, and it differs from `content` while ops from others are not shown yet.
+     */
+    async getReviewDoc(uri: vscode.Uri): Promise<{doc: DocumentEntity, content: string, base: string, ranges: RangesTracker} | undefined> {
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) { return undefined; }
+        const doc = fileEntity as DocumentEntity;
+        await this.syncSettled(doc);
+        if (doc.version === undefined || doc.remoteCache === undefined || !doc.ranges) {
+            const before = doc.remoteCache;
+            await this.resyncDoc(doc);
+            if (before !== doc.remoteCache) {
+                this.notify([{type: vscode.FileChangeType.Changed, uri}]);
+            }
+        }
+        return {doc, content: doc.remoteCache!, base: doc.localCache ?? doc.remoteCache!, ranges: doc.ranges!};
+    }
+
+    /** Accept tracked changes: insertions stay, deletions go for good. */
+    async acceptChanges(uri: vscode.Uri, changeIds: string[]) {
+        this.requireConnection();
+        const review = await this.getReviewDoc(uri);
+        if (!review || changeIds.length === 0) { return; }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.acceptChanges(identity, this.projectId, review.doc._id, changeIds);
+        if (res.type !== 'success') {
+            throw new Error(res.message ?? 'unknown error');
+        }
+        // the server also broadcasts 'accept-changes'; removing twice is harmless
+        review.doc.ranges?.removeChangeIds(changeIds);
+        this.fireReviewChanged(review.doc._id);
+    }
+
+    /**
+     * Reject tracked changes: remove inserted text, restore deleted text. Sent as undo ops
+     * (`u`), which make the server drop the changes instead of keeping them, and untracked,
+     * so that the reverts never become suggestions themselves.
+     */
+    async rejectChanges(uri: vscode.Uri, changeIds: string[]) {
+        await this.submitDocOps(uri, (doc) => rejectOps(doc.remoteCache!, doc.ranges!.getChanges(changeIds)), false);
+    }
+
+    /** Comment on `length` characters at `offset` (in the server's content) with a new thread. */
+    async addComment(uri: vscode.Uri, offset: number, length: number, content: string): Promise<string> {
+        this.requireConnection();
+        const threadId = RangesTracker.generateId();
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        // the message first, then the comment op, as the web editor does
+        const res = await this.api.sendThreadMessage(identity, this.projectId, threadId, content);
+        if (res.type !== 'success') {
+            throw new Error(res.message ?? 'unknown error');
+        }
+        await this.submitDocOps(uri, (doc) => {
+            const text = doc.remoteCache!.slice(offset, offset + length);
+            return {ops: [{p: offset, c: text, t: threadId}], content: doc.remoteCache!};
+        });
+        return threadId;
+    }
+
+    /**
+     * Send ops built from the doc's current server content in an update of their own, and
+     * wait until the server has applied them. `build` sees the settled doc, ranges included.
+     */
+    private async submitDocOps(uri: vscode.Uri, build: (doc: DocumentEntity) => {ops: NonNullable<UpdateSchema['op']>, content: string},
+                               tracked = this.isTrackingChanges, seed?: string) {
+        this.requireConnection();
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (fileType !== 'doc' || !fileEntity) { throw vscode.FileSystemError.FileNotFound(uri); }
+        const doc = fileEntity as DocumentEntity;
+        await this.syncSettled(doc);
+        if (doc.unconfirmed) {
+            await this.submitWrite(uri, doc, doc.unconfirmed);
+            await this.syncSettled(doc);
+        }
+        if (doc.version === undefined || doc.remoteCache === undefined || !doc.ranges) {
+            await this.resyncDoc(doc);
+        }
+        const {ops, content} = build(doc);
+        if (ops.length === 0) { return doc; }
+        const update: UpdateSchema = {
+            doc: doc._id,
+            lastV: doc.lastVersion,
+            v: doc.version!,
+            ...(tracked ? { meta: { tc: seed ?? generateTrackChangesIdSeed() } } : {}),
+            op: ops,
+        };
+        const write: PendingWrite = {update, mergeRes: content, content, base: doc.localCache!};
+        // Not kept for a retry at the doc's next write, as a save is: a reject or a replayed
+        // offline save that seemed to fail would then still happen later, unasked (or twice:
+        // the journal sends an offline save again until it is on Overleaf).
+        try {
+            await this.submitWrite(uri, doc, write);
+            await this.syncSettled(doc);
+        } catch (err) {
+            if (doc.unconfirmed === write) { doc.unconfirmed = undefined; }
+            throw err;
+        }
+        if (doc.unconfirmed === write) {
+            doc.unconfirmed = undefined;
+            throw new Error(vscode.l10n.t('Overleaf did not confirm the change.'));
+        }
+        return doc;
+    }
+
+    /** Whether the project is joined, so that requests to Overleaf can go through. */
+    get isJoined(): boolean {
+        return this.root !== undefined && !this.offline && this.connectionState !== 'reconnecting' && this.connectionState !== 'offline';
+    }
+
+    /** Review actions are requests to Overleaf: fail at once while offline, never later. */
+    private requireConnection() {
+        if (!this.isJoined) {
+            throw new Error(vscode.l10n.t('This needs a connection to Overleaf ({serverName}).', {serverName: this.serverName}));
+        }
+    }
+
+    private get trackingKey() {
+        return `overleaf-workshop.lastTrackChanges/${this.serverName}/${this.projectId}/${this.userId}`;
+    }
+
+    /** Keep this user's mode, so that saves while offline (even after a restart) know it. */
+    private rememberTracking() {
+        try {
+            if (this.root) { this.context.globalState.update(this.trackingKey, this.isTrackingChanges); }
+        } catch { /* best effort */ }
+    }
+
+    /** A switch made while offline, not on Overleaf yet. */
+    private get offlineTrackingKey() {
+        return `${this.trackingKey}/offline`;
+    }
+
+    private stored(key: string): boolean | undefined {
+        try { return this.context.globalState.get<boolean>(key); } catch { return undefined; }
+    }
+
+    /**
+     * The user's mode (Reviewing: true), also while offline: then a switch made while offline,
+     * or else the mode last known (Overleaf's when last connected). Undefined if never known.
+     */
+    get knownTracking(): boolean | undefined {
+        if (this.root && this.isJoined) { return this.isTrackingChanges; }
+        if (this.socket?.permissionsLevel === 'review') { return true; }
+        return this.stored(this.offlineTrackingKey) ?? this.stored(this.trackingKey);
+    }
+
+    /**
+     * Switch while offline. The local copy keeps every save with its mode, so the switch
+     * applies to the saves from now on at once; it reaches Overleaf when the connection is
+     * back (see settleOfflineSwitch).
+     */
+    private async switchWhileOffline(on: boolean) {
+        if (this.socket?.permissionsLevel === 'review' && !on) {
+            throw new Error(vscode.l10n.t('As a reviewer, your edits are always suggestions.'));
+        }
+        const last = this.stored(this.trackingKey);
+        // back to the mode Overleaf had: nothing left to send
+        await this.context.globalState.update(this.offlineTrackingKey, on===last ? undefined : on);
+        const mode = on ? vscode.l10n.t('Reviewing') : vscode.l10n.t('Editing');
+        log('info', `review: switched to ${on ? 'Reviewing' : 'Editing'} while not connected` +
+                    `${on===last ? ' (as on Overleaf)' : ': sent to Overleaf when the connection is back'}`);
+        vscode.window.showInformationMessage(on
+            ? vscode.l10n.t('{mode} while offline: your saves from now on become suggestions. Overleaf is switched too when the connection is back.', {mode})
+            : vscode.l10n.t('{mode} while offline: your saves from now on are applied directly. Overleaf is switched too when the connection is back.', {mode}));
+        this.fireReviewChanged();
+    }
+
+    /**
+     * Just joined: bring a switch made while offline together with Overleaf's mode, as the
+     * files are merged, against the mode known when the connection went. Changed only here:
+     * sent to Overleaf. Changed only on Overleaf (another device): kept. With two modes, a
+     * switch on both sides ends in the same mode, so there is never anything to ask. The
+     * saves made while offline go up in their own modes either way.
+     */
+    private async settleOfflineSwitch() {
+        const offline = this.stored(this.offlineTrackingKey);
+        if (offline===undefined) { this.rememberTracking(); return; }
+        await this.context.globalState.update(this.offlineTrackingKey, undefined);
+        if (offline===this.isTrackingChanges) {
+            log('info', `review: the switch to ${offline ? 'Reviewing' : 'Editing'} made while offline: Overleaf has it already`);
+            this.rememberTracking();
+            return;
+        }
+        // Overleaf still has the mode of before (a switch is only kept while it differs from it)
+        await this.setTrackChangesForMe(offline);
+        vscode.window.showInformationMessage(vscode.l10n.t('Switched to {mode} on Overleaf, as you chose while offline.',
+            {mode: offline ? vscode.l10n.t('Reviewing') : vscode.l10n.t('Editing')}));
+    }
+
+    /**
+     * The connection status item was clicked while not connected: switch the mode (it
+     * applies to the saves from now on), and once reconnecting gave up, Retry or Reload.
+     */
+    async connectionMenu() {
+        const level = this.socket?.permissionsLevel;
+        const reviewing = this.knownTracking ?? false;
+        const items: (vscode.QuickPickItem & {id: string})[] = [];
+        if (level!=='readOnly' && level!=='review') {
+            items.push(reviewing
+                ? {id: 'mode', label: '$(edit) ' + vscode.l10n.t('Switch to Editing'),
+                   detail: vscode.l10n.t('Your saves from now on are applied directly; Overleaf is switched when the connection is back.')}
+                : {id: 'mode', label: '$(git-pull-request-draft) ' + vscode.l10n.t('Switch to Reviewing'),
+                   detail: vscode.l10n.t('Your saves from now on become suggestions; Overleaf is switched when the connection is back.')});
+        }
+        if (this.gaveUp && !this.root && !this.initializing) {
+            items.push({id: 'retry', label: '$(refresh) ' + vscode.l10n.t('Retry')},
+                       {id: 'reload', label: '$(debug-restart) ' + vscode.l10n.t('Reload')});
+        }
+        if (items.length===0) { return; }
+        const pick = await vscode.window.showQuickPick(items, {
+            title: vscode.l10n.t('Not connected to {serverName}', {serverName: this.serverName}),
+        });
+        switch (pick?.id) {
+            case 'mode':
+                await this.setTrackChangesForMe(!reviewing).catch((err) => vscode.window.showErrorMessage(
+                    vscode.l10n.t('Could not switch track changes: {error}', {error: err?.message ?? String(err)})));
+                break;
+            case 'retry': this.retryNow(); break;
+            case 'reload': vscode.commands.executeCommand('workbench.action.reloadWindow'); break;
+        }
+    }
+
+    /**
+     * Apply `ops` to the doc `uri`, built on its server text `expected`, tracked (Reviewing)
+     * or not, whatever the user's mode is now: a save made offline goes in the mode it was
+     * made in. Resolves with the server's text after; throws a StaleRemoteError if the
+     * server's text is no longer `expected`.
+     */
+    async applyEdits(uri: vscode.Uri, expected: string, ops: {p: number, i?: string, d?: string, u?: boolean}[], tracked: boolean,
+                     seed?: string): Promise<string> {
+        const doc = await this.submitDocOps(uri, (doc) => {
+            if (doc.remoteCache !== expected) { throw new StaleRemoteError('changed on Overleaf meanwhile'); }
+            return {ops, content: applyTextOps(expected, ops)};
+        }, tracked, seed);
+        if (doc.remoteCache === undefined) { await this.resyncDoc(doc); }
+        setTimeout(() => this.notify([{type: vscode.FileChangeType.Changed, uri}]), 10);
+        return doc.remoteCache!;
+    }
+
+    /** The project's comment threads, loaded once and then kept up to date. */
+    async getThreads(): Promise<{[threadId:string]: CommentThread}> {
+        if (this.threads) { return this.threads; }
+        this.threadsLoading ??= (async () => {
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const res = await this.api.getThreads(identity, this.projectId);
+            if (res.type !== 'success' || !res.threads) {
+                throw new Error(res.message ?? 'could not load the comments');
+            }
+            this.threads = res.threads;
+            return res.threads;
+        })().finally(() => { this.threadsLoading = undefined; });
+        return this.threadsLoading;
+    }
+
+    get loadedThreads(): {[threadId:string]: CommentThread} | undefined {
+        return this.threads;
+    }
+
+    private onThreadEvent(event: ThreadEvent) {
+        const threads = this.threads;
+        if (!threads) { return; } // not loaded yet: they will be complete when they are
+        const thread = threads[event.threadId] ??= {messages: []};
+        switch (event.type) {
+            case 'new-comment':
+                if (!thread.messages.some((m) => m.id === event.message.id)) {
+                    thread.messages.push(event.message);
+                }
+                break;
+            case 'edit-message':
+                thread.messages = thread.messages.map((m) => m.id === event.messageId ? {...m, content: event.content} : m);
+                break;
+            case 'delete-message':
+                thread.messages = thread.messages.filter((m) => m.id !== event.messageId);
+                break;
+            case 'resolve-thread':
+                thread.resolved = true;
+                thread.resolved_at = new Date().toISOString();
+                thread.resolved_by_user = event.user;
+                thread.resolved_by_user_id = event.user?.id;
+                break;
+            case 'reopen-thread':
+                thread.resolved = undefined;
+                thread.resolved_at = undefined;
+                thread.resolved_by_user = undefined;
+                thread.resolved_by_user_id = undefined;
+                break;
+            case 'delete-thread':
+                delete threads[event.threadId];
+                this.allDocs().forEach(({doc}) => doc.ranges?.removeCommentId(event.threadId));
+                break;
+        }
+        this.fireReviewChanged();
+    }
+
+    /** The doc a comment thread is anchored in, among the docs whose ranges are loaded. */
+    findThreadDoc(threadId: string): DocumentEntity | undefined {
+        return this.allDocs().find(({doc}) => doc.ranges?.comments.some((c) => c.op.t === threadId))?.doc;
+    }
+
+    /** The first message of a comment thread made offline (its comment op follows, see placeComment). */
+    async postThreadMessage(threadId: string, content: string) {
+        this.requireConnection();
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.sendThreadMessage(identity, this.projectId, threadId, content);
+        if (res.type !== 'success') { throw refused(res.message); }
+    }
+
+    /**
+     * Comment with the thread `threadId` on `text` at `offset` of the doc's server text
+     * `expected` (a comment made offline). Throws a StaleRemoteError if the text moved.
+     */
+    async placeComment(uri: vscode.Uri, expected: string, offset: number, text: string, threadId: string) {
+        await this.submitDocOps(uri, (doc) => {
+            if (doc.remoteCache !== expected) { throw new StaleRemoteError('changed on Overleaf meanwhile'); }
+            if (expected.slice(offset, offset + text.length) !== text) { throw new Error('the commented text is not there'); }
+            return {ops: [{p: offset, c: text, t: threadId}], content: expected};
+        }, false);
+        this.fireReviewChanged();
+    }
+
+    /** The threads are read again when next needed (after offline changes were sent). */
+    forgetThreads() {
+        this.threads = undefined;
+        this.fireReviewChanged();
+    }
+
+    async replyToThread(threadId: string, content: string) {
+        this.requireConnection();
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.sendThreadMessage(identity, this.projectId, threadId, content);
+        if (res.type !== 'success') { throw refused(res.message); }
+    }
+
+    async editThreadMessage(threadId: string, messageId: string, content: string) {
+        this.requireConnection();
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.editThreadMessage(identity, this.projectId, threadId, messageId, content);
+        if (res.type !== 'success') { throw refused(res.message); }
+    }
+
+    async deleteOwnThreadMessage(threadId: string, messageId: string) {
+        this.requireConnection();
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.deleteOwnThreadMessage(identity, this.projectId, threadId, messageId);
+        if (res.type !== 'success') { throw refused(res.message); }
+    }
+
+    async setThreadResolved(threadId: string, resolved: boolean, docId?: string) {
+        this.requireConnection();
+        const doc = (docId ? this._resolveById(docId)?.fileEntity as DocumentEntity | undefined : undefined) ?? this.findThreadDoc(threadId);
+        if (!doc) { throw new RefusedError('the comment is not in any open document'); }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = resolved
+            ? await this.api.resolveThread(identity, this.projectId, doc._id, threadId)
+            : await this.api.reopenThread(identity, this.projectId, doc._id, threadId);
+        if (res.type !== 'success') { throw refused(res.message); }
+    }
+
+    async deleteThread(threadId: string, docId?: string) {
+        this.requireConnection();
+        const doc = (docId ? this._resolveById(docId)?.fileEntity as DocumentEntity | undefined : undefined) ?? this.findThreadDoc(threadId);
+        if (!doc) { throw new RefusedError('the comment is not in any open document'); }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.deleteThread(identity, this.projectId, doc._id, threadId);
+        if (res.type !== 'success') { throw refused(res.message); }
+        // the server also broadcasts 'delete-thread'
+        doc.ranges?.removeCommentId(threadId);
+        if (this.threads) { delete this.threads[threadId]; }
+        this.fireReviewChanged(doc._id);
+    }
+
+    /** Tracked changes and comments of every doc, also those not opened (read-only overview). */
+    async getProjectRanges(): Promise<{docId: string, ranges: DocRanges}[]> {
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const res = await this.api.getProjectRanges(identity, this.projectId);
+        if (res.type !== 'success' || !res.ranges) { throw new Error(res.message ?? 'could not load the changes'); }
+        return res.ranges.map(({id, ranges}) => ({docId: id, ranges}));
     }
 
     private remoteWatch(): void {
@@ -785,12 +1327,24 @@ export class VirtualFileSystem extends vscode.Disposable {
                 if (!this.root) { return; }
                 const wasTracking = this.isTrackingChanges;
                 this.root.trackChangesState = state;
+                this.rememberTracking();
+                log('info', `review: the server says track changes ${JSON.stringify(state)}: ${this.isTrackingChanges ? 'Reviewing' : 'Editing'}`);
                 if (this.isTrackingChanges !== wasTracking) {
                     vscode.window.showInformationMessage(this.isTrackingChanges
                         ? vscode.l10n.t('Track changes is on: your saves to {projectName} are now recorded as suggestions.', {projectName: this.projectName})
                         : vscode.l10n.t('Track changes is off: your saves to {projectName} are now applied directly.', {projectName: this.projectName}));
                 }
-                this.updateTrackChangesIndicator();
+                this.fireReviewChanged();
+            },
+            onChangesAccepted: (docId:string, changeIds:string[]) => {
+                const doc = this._resolveById(docId)?.fileEntity as DocumentEntity | undefined;
+                if (doc?.ranges) {
+                    doc.ranges.removeChangeIds(changeIds);
+                    this.fireReviewChanged(docId);
+                }
+            },
+            onThreadEvent: (event:ThreadEvent) => {
+                this.onThreadEvent(event);
             },
             onRootDocUpdated: (rootDocId:string) => {
                 //NOTE: do not sync rootDocId
@@ -826,6 +1380,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
             }
         });
+        this.applyOpsToRanges(doc, update.op, update.meta);
         // `localCache` is not advanced here but when the editor actually reloads the doc
         // (see openFile): if the user types before that, the reload is skipped and the
         // next write must still merge this op in rather than overwrite it.
@@ -895,6 +1450,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 doc.version = res.version;
                 doc.remoteCache = content;
                 doc.localCache  = content;
+                this.setDocRanges(doc, res.ranges);
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             }
@@ -934,28 +1490,40 @@ export class VirtualFileSystem extends vscode.Disposable {
         let res = undefined;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
 
-        if (content.length===0) {
+        // A text file becomes a doc as in the web editor: created empty, then its text added
+        // (untracked, as an upload is). Uploading it failed on overleaf.com without a word,
+        // and the local replica then took the file for synced although Overleaf never had it.
+        const text = content.length > 0 && isText(content) ? toLf(new TextDecoder().decode(content)) : undefined;
+        if (content.length===0 || text!==undefined) {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
             if (_res.type==='success') {
                 res = _res.entity;
+            } else {
+                throw new Error(vscode.l10n.t('Overleaf did not create {name}: {error}', {name: fileName, error: _res.message ?? 'unknown error'}));
             }
         } else {
             const parentFolderId = parentFolder._id;
             const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
-            if (_res.type==='success' && _res.entity!==undefined) {
+            if (_res.type==='success' && _res.entity?._type) {
                 res = _res.entity;
             } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
+                log('warn', `create: upload of ${fileName} failed: ${_res.message ?? JSON.stringify(_res).slice(0, 300)}`);
+                throw new Error(vscode.l10n.t('Overleaf did not accept the upload of {name}: {error}', {name: fileName, error: _res.message ?? 'unknown error'}));
             }
         }
-        if (res && res._type) {
-            this.insertEntity(parentFolder, res._type, res);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
+        if (!res || !res._type) {
+            throw new Error(vscode.l10n.t('Overleaf did not create {name}.', {name: fileName}));
         }
+        this.insertEntity(parentFolder, res._type, res);
+        // Announced only once it has its text: announced empty, a local replica took it for
+        // a change on Overleaf, "merged" it with the local file into conflict markers, and
+        // uploaded those.
+        if (text!==undefined && text.length > 0) {
+            await this.applyEdits(uri, '', [{p: 0, i: text}], false);
+        }
+        this.notify([
+            {type: vscode.FileChangeType.Created, uri: uri},
+        ]);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -1106,7 +1674,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         // if exists and is doc --> update
         if (fileType && fileType==='doc' && fileEntity) {
             const doc = fileEntity as DocumentEntity;
-            const _content = new TextDecoder().decode(content);
+            // Overleaf keeps LF line breaks only: CRs sent along (a local copy with Windows
+            // line breaks) gave its text another length than ours, and every later op landed
+            // in the wrong place, until the doc was read again.
+            const _content = toLf(new TextDecoder().decode(content));
             // one write per doc at a time: wait until the previous one is reconciled
             await this.syncSettled(doc);
             if (doc.unconfirmed) {
@@ -1141,27 +1712,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                         ).digest('hex');
                     }
                 })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache!, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
+                op: editOps(uri, doc.remoteCache!, mergeRes),
             };
+            if (update.op.length > 0) {
+                const why = EditRecorder.why(uri, doc.remoteCache!, mergeRes);
+                log('info', `write: ${uri.path}: ${update.op.length} ops ${why === undefined ? 'as typed' : `from a diff, as ${why}`}` +
+                            `${update.meta?.tc ? ', tracked (Reviewing)' : ''}: ${JSON.stringify(update.op).slice(0, 300)}`);
+            }
             this.isDirty = update.op.length>0;
             if (update.op.length===0) {
                 // nothing to send: the server already holds this content
@@ -1226,6 +1783,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // this scheme sends no ack: the callback is all there is
                 doc.lastVersion = write.update.v;
                 doc.version = write.update.v + 1;
+                this.applyOpsToRanges(doc, write.update.op, {...write.update.meta, user_id: this.userId});
                 this.endSync(doc, sync);
             } else {
                 this.reconcile(uri, doc, sync, write);
@@ -1260,6 +1818,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // applied as sent: our content is exactly the server's
                 doc.lastVersion = baseVersion;
                 doc.version = baseVersion + 1;
+                this.applyOpsToRanges(doc, write.update.op, {...write.update.meta, user_id: this.userId});
             } else {
                 // Ops from others went first and ours was transformed against them, or there
                 // was no ack. Read the doc back; joining it also puts us back in its room.
@@ -1321,6 +1880,40 @@ export class VirtualFileSystem extends vscode.Disposable {
         doc.remoteCache = content;
         if (doc.localCache===undefined) { doc.localCache = content; }
         doc.mtime = undefined;
+        this.setDocRanges(doc, res.ranges);
+    }
+
+    /** Start tracking `doc`'s ranges afresh, from what joinDoc returned. */
+    private setDocRanges(doc: DocumentEntity, ranges?: DocRanges) {
+        // copies: the tracker changes them in place
+        doc.ranges = new RangesTracker(
+            structuredClone(ranges?.changes ?? []),
+            structuredClone(ranges?.comments ?? []),
+        );
+        this.fireReviewChanged(doc._id);
+    }
+
+    /**
+     * Apply ops the server applied to `doc` to its ranges, as the server does: tracked when
+     * the update carries a `tc` seed (the server builds the change ids from it), by the
+     * update's author. Should they not fit (the tracker checks deleted text against
+     * comments), the ranges are dropped and re-read with the doc.
+     */
+    private applyOpsToRanges(doc: DocumentEntity, ops: UpdateSchema['op'], meta?: UpdateSchema['meta']) {
+        const ranges = doc.ranges;
+        if (!ranges || !ops?.length) { return; }
+        try {
+            ranges.track_changes = meta?.tc!==undefined;
+            if (meta?.tc!==undefined) { ranges.setIdSeed(meta.tc); }
+            const metadata = {user_id: meta?.user_id ?? null, ts: meta?.ts!==undefined ? new Date(meta.ts) : new Date()};
+            for (const op of ops) {
+                ranges.applyOp(op, metadata);
+            }
+        } catch (err:any) {
+            log('warn', `review: ranges of doc ${doc._id} out of step (${err?.message ?? err}); re-reading them`);
+            doc.ranges = undefined;
+        }
+        this.fireReviewChanged(doc._id);
     }
 
     async mkdir(uri: vscode.Uri) {
@@ -1766,6 +2359,17 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
         }
     }
 
+    /**
+     * The project of this window: its Overleaf folder, or the one its local replica mirrors
+     * (the only project a replica window opens).
+     */
+    private windowVfs(uri?: vscode.Uri): VirtualFileSystem | undefined {
+        uri = uri || vscode.workspace.workspaceFolders?.[0].uri;
+        if (uri?.scheme === ROOT_NAME) { return this.vfss[uri.query] ?? undefined; }
+        const all = Object.values(this.vfss);
+        return all.length===1 ? all[0] : undefined;
+    }
+
     prefetch(uri: vscode.Uri): Promise<VirtualFileSystem> {
         return this.getVFS(uri).then((vfs) => {return vfs;});
     }
@@ -1830,10 +2434,11 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
             }),
             // the red connection status item: offer Retry and Reload
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.reconnect`, (uri?: vscode.Uri) => {
-                uri = uri || vscode.workspace.workspaceFolders?.[0].uri;
-                if (uri?.scheme === ROOT_NAME) {
-                    return this.prefetch(uri).then((vfs) => vfs.onConnectionStatusClicked());
-                }
+                return this.windowVfs(uri)?.onConnectionStatusClicked();
+            }),
+            // the connection status item while not connected: switch the mode, Retry, Reload
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.connectionMenu`, (uri?: vscode.Uri) => {
+                return this.windowVfs(uri)?.connectionMenu();
             }),
         ];
     }

@@ -109,10 +109,21 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem.tooltip = tooltip;
 
         // update status bar item text
-        if (numPush!==0) {
+        const attention = this.scms.find(({scm, enabled}) => enabled && scm.status.status==='need-attention');
+        const pending = this.scms.find(({scm, enabled}) => enabled && scm.status.status==='pending');
+        this.statusBarItem.command = `${ROOT_NAME}.projectSCM.configSCM`;
+        this.statusBarItem.backgroundColor = undefined;
+        if (attention) {
+            // files in conflict: until resolved, a click brings the dialog back
+            this.statusBarItem.text = `$(warning) ${attention.scm.status.message}`;
+            this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+            this.statusBarItem.command = `${ROOT_NAME}.projectSCM.showConflicts`;
+        } else if (numPush!==0) {
             this.statusBarItem.text = `$(cloud-upload)`;
         } else if (numPull!==0) {
             this.statusBarItem.text = `$(cloud-download)`;
+        } else if (pending) {
+            this.statusBarItem.text = `$(cloud-upload) ${pending.scm.status.message}`;
         } else {
             this.statusBarItem.text = `$(cloud)`;
         }
@@ -302,6 +313,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.configSCM`, () => {
                 return this.showSCMConfiguration();
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.showConflicts`, async () => {
+                for (const {scm, enabled} of this.scms) {
+                    if (enabled && scm instanceof LocalReplicaSCMProvider) { await scm.showConflicts(); }
+                }
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCM`, (scmProto) => {
                 return this.createNewSCM(scmProto);
